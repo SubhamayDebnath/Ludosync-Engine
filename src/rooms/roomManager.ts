@@ -1,0 +1,38 @@
+import { generateRoomCode } from "../util/code.js";
+import { Room, ROOM_IDLE_EXPIRE_MS } from "./room.js";
+
+export class RoomManager {
+  private rooms = new Map<string, Room>();
+
+  createRoom(maxPlayers: number): Room {
+    let code = generateRoomCode();
+    while (this.rooms.has(code)) code = generateRoomCode();
+    const room = new Room(code, maxPlayers);
+    room.status = "CREATING";
+    this.rooms.set(code, room);
+    room.expireTimer = setTimeout(() => this.expireRoom(code), ROOM_IDLE_EXPIRE_MS);
+    return room;
+  }
+
+  get(code: string): Room | undefined {
+    return this.rooms.get(code.toUpperCase());
+  }
+
+  expireRoom(code: string) {
+    const room = this.rooms.get(code);
+    if (!room) return;
+    room.expire();
+    this.rooms.delete(code);
+  }
+
+  /** Removes a finished/expired room a short while after it's no longer needed. */
+  scheduleCleanup(code: string, delayMs = 60_000) {
+    setTimeout(() => this.expireRoom(code), delayMs);
+  }
+
+  get size(): number {
+    return this.rooms.size;
+  }
+}
+
+export const roomManager = new RoomManager();
