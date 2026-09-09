@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createInitialGameState } from "../src/game/state.js";
-import { applyMove, skipTurn } from "../src/game/movement.js";
+import { advanceTurn, applyMove, skipTurn } from "../src/game/movement.js";
 import { FINISH_STEP } from "../src/game/types.js";
 
 function twoPlayerState() {
@@ -67,13 +67,60 @@ describe("applyMove", () => {
   it("captures an opponent piece landing on a non-safe shared square", () => {
     const state = twoPlayerState();
     const [p1, p2] = state.players;
-    p2.pieces[0].steps = 45; // green global square = (13+45-1)%52 = 5
+    p2.pieces[0].steps = 32; // yellow (offset 26) global square = (26+32-1)%52 = 5
     p1.pieces[0].steps = 1; // red global square = 0
     state.currentDice = 5; // moves red piece to steps=6 -> global square 5
     const result = applyMove(state, p1.pieces[0].id);
     expect(result.ok).toBe(true);
     expect(result.info?.captured).toHaveLength(1);
     expect(p2.pieces[0].steps).toBe(0); // sent back to yard
+  });
+
+  it("grants a bonus roll (no turn advance) when a capture is landed, even without a six", () => {
+    const state = twoPlayerState();
+    const [p1, p2] = state.players;
+    p2.pieces[0].steps = 32; // yellow global square 5
+    p1.pieces[0].steps = 1; // red global square 0
+    state.currentDice = 5; // -> global square 5, captures p2's piece
+    const beforeTurn = state.turnIndex;
+    const result = applyMove(state, p1.pieces[0].id);
+    expect(result.ok).toBe(true);
+    expect(result.info?.bonusReason).toBe("capture");
+    expect(state.turnIndex).toBe(beforeTurn); // bonus roll, same player's turn again
+  });
+
+  it("does not grant a bonus roll for a plain non-capturing, non-six move", () => {
+    const state = twoPlayerState();
+    state.players[0].pieces[0].steps = 10;
+    state.currentDice = 4;
+    const result = applyMove(state, state.players[0].pieces[0].id);
+    expect(result.ok).toBe(true);
+    expect(result.info?.bonusReason).toBeUndefined();
+    expect(state.turnIndex).toBe(1);
+  });
+});
+
+describe("advanceTurn", () => {
+  it("skips a player who has left the match", () => {
+    const state = createInitialGameState([
+      { id: "p1", name: "Alice", isGuest: false, userId: "u1" },
+      { id: "p2", name: "Bob", isGuest: true, userId: null },
+      { id: "p3", name: "Cara", isGuest: true, userId: null },
+    ]);
+    state.players[1].left = true; // p2 quit
+    advanceTurn(state); // from p1 (index 0), should skip p2 and land on p3
+    expect(state.turnIndex).toBe(2);
+  });
+
+  it("skips a player who has already finished all pieces", () => {
+    const state = createInitialGameState([
+      { id: "p1", name: "Alice", isGuest: false, userId: "u1" },
+      { id: "p2", name: "Bob", isGuest: true, userId: null },
+      { id: "p3", name: "Cara", isGuest: true, userId: null },
+    ]);
+    state.players[1].finished = true;
+    advanceTurn(state);
+    expect(state.turnIndex).toBe(2);
   });
 });
 

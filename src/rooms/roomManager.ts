@@ -1,5 +1,5 @@
 import { generateRoomCode } from "../util/code.js";
-import { Room, ROOM_IDLE_EXPIRE_MS } from "./room.js";
+import { Room } from "./room.js";
 
 export class RoomManager {
   private rooms = new Map<string, Room>();
@@ -10,7 +10,9 @@ export class RoomManager {
     const room = new Room(code, maxPlayers);
     room.status = "CREATING";
     this.rooms.set(code, room);
-    room.expireTimer = setTimeout(() => this.expireRoom(code), ROOM_IDLE_EXPIRE_MS);
+    // Note: no blind lifetime timer here. Pre-game idle rooms are closed by
+    // Room's own ROOM_AUTO_CLOSE_MS timer (started when it enters LOBBY); an in-progress
+    // match is never force-killed by a flat clock, only by the disconnect-forfeit flow.
     return room;
   }
 
@@ -32,6 +34,11 @@ export class RoomManager {
 
   get size(): number {
     return this.rooms.size;
+  }
+
+  /** All rooms currently in memory — used by the admin API, never exposed to regular clients. */
+  listRooms(): Room[] {
+    return Array.from(this.rooms.values());
   }
 }
 

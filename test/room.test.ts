@@ -45,7 +45,8 @@ describe("Room", () => {
     expect(room.status).toBe("PLAYING");
     expect(room.game?.players).toHaveLength(2);
     expect(room.game?.players[0].color).toBe("red");
-    expect(room.game?.players[1].color).toBe("green");
+    // 2-player games seat colors diagonally opposite (red + yellow), not side-by-side.
+    expect(room.game?.players[1].color).toBe("yellow");
   });
 
   it("destroys chat when the room expires", () => {

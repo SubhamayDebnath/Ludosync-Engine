@@ -4,12 +4,14 @@ import {
   findCaptures,
   globalSquare,
   hasWon,
+  isBlockedForOpponent,
   isSafeSquare,
   isTripleSix,
   legalMovesForPlayer,
 } from "../src/game/rules.js";
 import { FINISH_STEP } from "../src/game/types.js";
 
+// 2-player games seat colors diagonally opposite: red (offset 0) + yellow (offset 26).
 function twoPlayerState() {
   return createInitialGameState([
     { id: "p1", name: "Alice", isGuest: false, userId: "u1" },
@@ -21,8 +23,8 @@ describe("legalMovesForPlayer", () => {
   it("only allows leaving the yard on a 6", () => {
     const state = twoPlayerState();
     const player = state.players[0];
-    expect(legalMovesForPlayer(player, 5)).toHaveLength(0);
-    const moves = legalMovesForPlayer(player, 6);
+    expect(legalMovesForPlayer(state, player, 5)).toHaveLength(0);
+    const moves = legalMovesForPlayer(state, player, 6);
     expect(moves).toHaveLength(4); // all 4 pieces can leave yard
     expect(moves[0].toSteps).toBe(1);
   });
@@ -31,9 +33,9 @@ describe("legalMovesForPlayer", () => {
     const state = twoPlayerState();
     const player = state.players[0];
     player.pieces[0].steps = FINISH_STEP - 2;
-    const moves = legalMovesForPlayer(player, 5);
+    const moves = legalMovesForPlayer(state, player, 5);
     expect(moves.find((m) => m.pieceId === player.pieces[0].id)).toBeUndefined();
-    const okMoves = legalMovesForPlayer(player, 2);
+    const okMoves = legalMovesForPlayer(state, player, 2);
     expect(okMoves.find((m) => m.pieceId === player.pieces[0].id)?.toSteps).toBe(FINISH_STEP);
   });
 
@@ -41,8 +43,31 @@ describe("legalMovesForPlayer", () => {
     const state = twoPlayerState();
     const player = state.players[0];
     player.pieces[0].steps = FINISH_STEP;
-    const moves = legalMovesForPlayer(player, 6);
+    const moves = legalMovesForPlayer(state, player, 6);
     expect(moves.find((m) => m.pieceId === player.pieces[0].id)).toBeUndefined();
+  });
+
+  it("blocks a move that would land on two-or-more stacked opponent pieces", () => {
+    const state = twoPlayerState();
+    const [p1, p2] = state.players;
+    // Stack two of p2's (yellow) pieces on global square 5.
+    // yellow offset = 26, so steps such that (26+steps-1)%52 === 5 => steps = 32.
+    p2.pieces[0].steps = 32;
+    p2.pieces[1].steps = 32;
+    // p1 (red, offset 0) already on the track at steps=1; +5 lands on global square (0+6-1)%52 = 5.
+    p1.pieces[0].steps = 1;
+    const moves = legalMovesForPlayer(state, p1, 5);
+    expect(moves.find((m) => m.pieceId === p1.pieces[0].id)).toBeUndefined();
+    expect(isBlockedForOpponent(state, "red", 5)).toBe(true);
+  });
+
+  it("does not block a landing with only a single opponent piece on the square", () => {
+    const state = twoPlayerState();
+    const [p1, p2] = state.players;
+    p2.pieces[0].steps = 32; // single piece on global square 5, not a block
+    p1.pieces[0].steps = 1;
+    const moves = legalMovesForPlayer(state, p1, 5);
+    expect(moves.find((m) => m.pieceId === p1.pieces[0].id)?.toSteps).toBe(6);
   });
 });
 
@@ -58,11 +83,11 @@ describe("captures", () => {
   it("sends an opponent piece back to the yard when landed on off a safe square", () => {
     const state = twoPlayerState();
     const [p1, p2] = state.players;
-    // p1 is red (offset 0), p2 is green (offset 13) in a 2-player game (index 1 -> green)
+    // p1 is red (offset 0), p2 is yellow (offset 26) in a 2-player game.
     // Put p2's piece on a common-track square that p1 can land on and is NOT safe.
     const targetSquare = 5; // not in SAFE_SQUARES
-    // p2's global square = (13 + steps - 1) % 52 = 5  => steps = (5 - 13 + 1 + 52) % 52 = 45
-    const p2Steps = ((targetSquare - 13 + 1) % 52 + 52) % 52 || 52;
+    // p2's global square = (26 + steps - 1) % 52 = 5  => steps = 32
+    const p2Steps = (((targetSquare - 26 + 1) % 52) + 52) % 52 || 52;
     p2.pieces[0].steps = p2Steps;
     expect(globalSquare(p2.pieces[0], p2Steps)).toBe(targetSquare);
 
@@ -75,11 +100,11 @@ describe("captures", () => {
   it("never captures on a safe square", () => {
     const state = twoPlayerState();
     const [p1, p2] = state.players;
-    // Green start square (13) is safe. Put p2 piece there (steps=1 => global square 13).
+    // Yellow start square (26) is safe. Put p2 piece there (steps=1 => global square 26).
     p2.pieces[0].steps = 1;
-    expect(globalSquare(p2.pieces[0], 1)).toBe(13);
-    // p1 moving to global square 13: steps such that (0+steps-1)%52 === 13 => steps=14
-    const captures = findCaptures(state, p1, 14);
+    expect(globalSquare(p2.pieces[0], 1)).toBe(26);
+    // p1 moving to global square 26: steps such that (0+steps-1)%52 === 26 => steps=27
+    const captures = findCaptures(state, p1, 27);
     expect(captures).toHaveLength(0);
   });
 

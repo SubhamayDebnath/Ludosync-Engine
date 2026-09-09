@@ -1,14 +1,16 @@
 import type { WebSocket } from "ws";
 import type { Db } from "mongodb";
 import { roomManager } from "../rooms/roomManager.js";
-import { Room, LOBBY_DURATION_MS, RECONNECT_WINDOW_MS, CHAT_RATE_LIMIT } from "../rooms/room.js";
+import { Room, ROOM_AUTO_CLOSE_MS, CHAT_RATE_LIMIT } from "../rooms/room.js";
 import { parseClientMessage } from "./protocol.js";
 import { rollDice } from "../game/dice.js";
 import { canRequestMove, canRollDice, playerHasNoLegalMoves } from "../game/validation.js";
-import { applyMove, skipTurn } from "../game/movement.js";
+import { applyMove, skipTurn, advanceTurn } from "../game/movement.js";
+import { currentPlayer } from "../game/state.js";
 import { isTripleSix } from "../game/rules.js";
 import { RateLimiter } from "../util/rateLimit.js";
 import { recordMatchResult } from "../db/matches.js";
+import { send, broadcast, broadcastRoomState, broadcastGameState } from "./broadcast.js";
 
 interface ConnMeta {
   roomCode: string | null;
@@ -18,10 +20,6 @@ interface ConnMeta {
 const connMeta = new WeakMap<WebSocket, ConnMeta>();
 const chatLimiter = new RateLimiter(CHAT_RATE_LIMIT.limit, CHAT_RATE_LIMIT.windowMs);
 const HEARTBEAT_INTERVAL_MS = 5_000;
-
-function send(ws: WebSocket, payload: unknown) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
-}
 
 /**
  * `fatal: true` means the client's current room/session is unusable and it's fair to
@@ -33,26 +31,56 @@ function sendError(ws: WebSocket, code: string, message: string, fatal = false) 
   send(ws, { type: "error", code, message, fatal });
 }
 
-function broadcast(room: Room, payload: unknown, exceptPlayerId?: string) {
-  for (const player of room.players.values()) {
-    if (exceptPlayerId && player.id === exceptPlayerId) continue;
-    if (player.ws) send(player.ws, payload);
-  }
-}
-
-function broadcastRoomState(room: Room) {
-  broadcast(room, { type: "room:state", room: room.toLobbyState() });
-}
-
-function broadcastGameState(room: Room, lastMove?: unknown) {
-  broadcast(room, { type: "game:state", ...room.toGameStatePayload(), lastMove: lastMove ?? null });
-}
-
 function sanitizeChatText(raw: string): string {
   // Strip HTML tags/links per spec: no links, no HTML.
   const noTags = raw.replace(/<[^>]*>/g, "");
   const noLinks = noTags.replace(/\bhttps?:\/\/\S+/gi, "[link removed]").replace(/\bwww\.\S+/gi, "[link removed]");
   return noLinks.trim().slice(0, 150);
+}
+
+/**
+ * Permanently removes a player from an in-progress match (either they explicitly quit, or
+ * they never reconnected within the grace window). Ends the game by forfeit if only one
+ * eligible player is left, otherwise just skips their future turns.
+ */
+function removePlayerFromMatch(room: Room, playerId: string, getDb: () => Promise<Db | null>) {
+  room.cancelRemoval(playerId);
+  const state = room.game;
+  if (!state || room.status !== "PLAYING") return;
+
+  const gamePlayer = state.players.find((p) => p.id === playerId);
+  if (!gamePlayer || gamePlayer.left) return;
+  gamePlayer.left = true;
+
+  if (state.waitingForPlayerId === playerId) state.waitingForPlayerId = null;
+
+  const stillEligible = state.players.filter((p) => !p.left && !p.finished);
+
+  if (stillEligible.length <= 1) {
+    // Match ends by forfeit — either a lone survivor wins, or (rare) everyone's gone.
+    state.status = "FINISHED";
+    if (stillEligible.length === 1) {
+      const winner = stillEligible[0];
+      state.winnerId = winner.id;
+      room.finish(winner.id);
+      broadcast(room, { type: "game:finished", winnerId: winner.id, reason: "opponent_left" });
+      getDb()
+        .then((db) => recordMatchResult(db, room, winner.id))
+        .catch(() => {});
+    } else {
+      broadcast(room, { type: "room:expired", reason: "all_players_left" });
+    }
+    roomManager.scheduleCleanup(room.code);
+    return;
+  }
+
+  // If it was (or was about to be) the departing player's turn, hand it to the next eligible seat.
+  if (currentPlayer(state).id === playerId) {
+    advanceTurn(state);
+  }
+  state.version += 1;
+  broadcastGameState(room);
+  broadcastRoomState(room);
 }
 
 export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>) {
@@ -86,6 +114,8 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
         player.ws = ws;
         connMeta.set(ws, { roomCode: room.code, playerId: player.id });
         room.startLobby();
+        // This ack IS the "server ready" signal the client waits on before enabling Start —
+        // the match itself never auto-starts; only an explicit room:start_now from the host does.
         send(ws, {
           type: "room:created",
           code: room.code,
@@ -93,7 +123,7 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
           playerToken: player.id,
           room: room.toLobbyState(),
         });
-        scheduleLobbyClose(room);
+        scheduleRoomAutoClose(room);
         break;
       }
 
@@ -114,6 +144,7 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
           }
           broadcast(room, { type: "player:reconnected", playerId: player.id }, player.id);
           broadcastRoomState(room);
+          if (room.game) broadcastGameState(room); // reflects the resumed (unpaused) state too
           return;
         }
 
@@ -133,14 +164,14 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
         const room = meta.roomCode ? roomManager.get(meta.roomCode) : undefined;
         if (!room || !meta.playerId) return;
         if (!room.isHost(meta.playerId)) {
-          return sendError(ws, "not_host", "Only the room creator can start the game early");
+          return sendError(ws, "not_host", "Only the room creator can start the game");
         }
         if (room.status !== "LOBBY") return;
         if (room.joinedCount < 2) {
           return sendError(ws, "not_enough_players", "Need at least 2 players to start");
         }
-        if (room.lobbyTimer) clearTimeout(room.lobbyTimer);
-        closeLobbyNow(room);
+        if (room.autoCloseTimer) clearTimeout(room.autoCloseTimer);
+        startMatchNow(room);
         break;
       }
 
@@ -154,9 +185,12 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
           room.joinOrder = room.joinOrder.filter((id) => id !== meta.playerId);
           broadcastRoomState(room);
         } else {
+          // An explicit in-match leave is a deliberate quit, not a network drop — forfeit
+          // immediately rather than making opponents wait out the reconnect window for it.
           room.markDisconnected(meta.playerId);
           broadcast(room, { type: "player:left", playerId: meta.playerId });
           broadcastRoomState(room);
+          removePlayerFromMatch(room, meta.playerId, getDb);
         }
         connMeta.set(ws, { roomCode: null, playerId: null });
         break;
@@ -180,6 +214,9 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
       case "dice:request": {
         const room = meta.roomCode ? roomManager.get(meta.roomCode) : undefined;
         if (!room || !room.game || !meta.playerId) return;
+        if (room.game.waitingForPlayerId) {
+          return sendError(ws, "game_paused", "Game is paused — waiting for a disconnected player to return");
+        }
         if (!canRollDice(room.game, meta.playerId)) {
           // Very common with a fast double-click; never fatal.
           return sendError(ws, "not_your_turn", "It's not your turn to roll");
@@ -215,7 +252,7 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
 
         if (result.wonPlayerId) {
           room.finish(result.wonPlayerId);
-          broadcast(room, { type: "game:finished", winnerId: result.wonPlayerId });
+          broadcast(room, { type: "game:finished", winnerId: result.wonPlayerId, reason: "completed" });
           getDb()
             .then((db) => recordMatchResult(db, room, result.wonPlayerId!))
             .catch(() => {});
@@ -243,23 +280,42 @@ export function handleConnection(ws: WebSocket, getDb: () => Promise<Db | null>)
     if (!meta?.roomCode || !meta.playerId) return;
     const room = roomManager.get(meta.roomCode);
     if (!room) return;
-    room.markDisconnected(meta.playerId);
-    broadcast(room, { type: "player:disconnected", playerId: meta.playerId });
+    const { playerId } = meta;
+
+    room.markDisconnected(playerId);
+    broadcast(room, { type: "player:disconnected", playerId });
     broadcastRoomState(room);
 
-    // Give the player a short window to reconnect before treating this as a permanent leave.
-    setTimeout(() => {
-      const p = room.players.get(meta.playerId!);
-      if (p && !p.connected) {
-        broadcast(room, { type: "player:left", playerId: meta.playerId });
-      }
-    }, RECONNECT_WINDOW_MS);
+    if (room.status === "PLAYING" && room.game) {
+      // Pause the match for everyone — see canRollDice — until they're back or removed.
+      room.game.waitingForPlayerId = playerId;
+      room.game.version += 1;
+      broadcastGameState(room);
+
+      room.scheduleRemoval(playerId, () => {
+        const p = room.players.get(playerId);
+        if (p && !p.connected) {
+          removePlayerFromMatch(room, playerId, getDb);
+        }
+      });
+    } else if (room.status === "LOBBY" || room.status === "READY") {
+      // Pre-game: give them the same grace window to come back before we free their seat,
+      // so a flaky connection while browsing the lobby doesn't instantly bump them out.
+      room.scheduleRemoval(playerId, () => {
+        const p = room.players.get(playerId);
+        if (p && !p.connected) {
+          room.players.delete(playerId);
+          room.joinOrder = room.joinOrder.filter((id) => id !== playerId);
+          broadcast(room, { type: "player:left", playerId });
+          broadcastRoomState(room);
+        }
+      });
+    }
   });
 }
 
-/** Shared by both the automatic 30s timer and a host's manual "start now". */
-function closeLobbyNow(room: Room) {
-  if (room.status !== "LOBBY") return;
+/** Starts the match — only ever called from an explicit host room:start_now. */
+function startMatchNow(room: Room) {
   const started = room.lockAndStart();
   if (!started) {
     room.expire();
@@ -270,6 +326,13 @@ function closeLobbyNow(room: Room) {
   broadcast(room, { type: "game:start", ...room.toGameStatePayload() });
 }
 
-function scheduleLobbyClose(room: Room) {
-  room.lobbyTimer = setTimeout(() => closeLobbyNow(room), LOBBY_DURATION_MS);
+/** Auto-closes a room that's sat in LOBBY/READY too long without the host starting it. */
+function scheduleRoomAutoClose(room: Room) {
+  room.autoCloseTimer = setTimeout(() => {
+    if (room.status === "LOBBY" || room.status === "READY") {
+      room.expire();
+      broadcast(room, { type: "room:expired", reason: "idle_timeout" });
+      roomManager.expireRoom(room.code);
+    }
+  }, ROOM_AUTO_CLOSE_MS);
 }

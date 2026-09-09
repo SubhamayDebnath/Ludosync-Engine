@@ -33,6 +33,8 @@ export interface PlayerState {
   connected: boolean;
   pieces: Piece[];
   finished: boolean;
+  /** True once this seat has been permanently removed (quit, or never reconnected within the grace window). */
+  left: boolean;
 }
 
 export type RoomStatus =
@@ -53,6 +55,12 @@ export interface GameState {
   consecutiveSixes: number;
   winnerId: string | null;
   version: number;
+  /**
+   * Set to the id of a disconnected seated player while the match is paused waiting for them
+   * to reconnect. While non-null, nobody (including connected players) may roll the dice —
+   * this keeps a dropped connection from being an unfair advantage for whoever is still around.
+   */
+  waitingForPlayerId: string | null;
 }
 
 export interface LastMoveInfo {
@@ -61,4 +69,6 @@ export interface LastMoveInfo {
   from: number;
   to: number;
   captured: { playerId: string; pieceId: string }[];
+  /** Why an extra roll was granted for this move, if any — lets the UI play the right sting. */
+  bonusReason?: "six" | "capture" | "six_and_capture";
 }

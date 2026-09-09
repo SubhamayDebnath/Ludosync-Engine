@@ -4,9 +4,14 @@ import type { GameState, RoomStatus } from "../game/types.js";
 import { createInitialGameState } from "../game/state.js";
 import { assertTransition } from "./stateMachine.js";
 
-export const LOBBY_DURATION_MS = Number(process.env.LOBBY_DURATION_MS_OVERRIDE) || 30_000;
-export const ROOM_IDLE_EXPIRE_MS = 30 * 60_000; // safety net GC for abandoned rooms
-export const RECONNECT_WINDOW_MS = 30_000;
+/**
+ * How long an un-started room (READY/LOBBY, host hasn't hit Start) is allowed to sit idle
+ * before it's auto-closed. Does NOT apply once a match is PLAYING — an in-progress game is
+ * never force-killed by a flat timer.
+ */
+export const ROOM_AUTO_CLOSE_MS = Number(process.env.ROOM_AUTO_CLOSE_MS_OVERRIDE) || 10 * 60_000;
+/** Grace period a disconnected in-match player has to reconnect before their seat is forfeited. */
+export const RECONNECT_WINDOW_MS = Number(process.env.RECONNECT_WINDOW_MS_OVERRIDE) || 2 * 60_000;
 export const CHAT_MAX_LEN = 150;
 export const CHAT_RATE_LIMIT = { limit: 5, windowMs: 5_000 };
 
@@ -28,6 +33,8 @@ export interface RoomPlayer {
   lastSeen: number;
   disconnectedAt: number | null;
   pingMs: number | null;
+  /** Pending forfeit timer while this player is disconnected mid-match; cleared on reconnect. */
+  removalTimer: NodeJS.Timeout | null;
 }
 
 export class Room {
@@ -37,13 +44,14 @@ export class Room {
   status: RoomStatus = "CREATING";
   createdAt = Date.now();
   lobbyStartAt: number | null = null;
-  lobbyEndAt: number | null = null;
+  /** When an un-started room will be auto-closed if the host hasn't hit Start by then. */
+  autoCloseAt: number | null = null;
   players = new Map<string, RoomPlayer>();
   joinOrder: string[] = [];
   chat: ChatMessage[] = [];
   game: GameState | null = null;
-  lobbyTimer: NodeJS.Timeout | null = null;
-  expireTimer: NodeJS.Timeout | null = null;
+  /** Fires ROOM_AUTO_CLOSE_MS after entering LOBBY; cleared once the host starts the match. */
+  autoCloseTimer: NodeJS.Timeout | null = null;
 
   constructor(code: string, maxPlayers: number) {
     this.code = code;
@@ -68,6 +76,7 @@ export class Room {
       lastSeen: Date.now(),
       disconnectedAt: null,
       pingMs: null,
+      removalTimer: null,
     };
     this.players.set(id, player);
     this.joinOrder.push(id);
@@ -81,6 +90,10 @@ export class Room {
     player.connected = true;
     player.disconnectedAt = null;
     player.lastSeen = Date.now();
+    this.cancelRemoval(playerId);
+    // Keep the authoritative game copy of connection state in sync so opponents' UI reflects it.
+    const gamePlayer = this.game?.players.find((p) => p.id === playerId);
+    if (gamePlayer) gamePlayer.connected = true;
     return player;
   }
 
@@ -90,6 +103,24 @@ export class Room {
     player.connected = false;
     player.ws = null;
     player.disconnectedAt = Date.now();
+    const gamePlayer = this.game?.players.find((p) => p.id === playerId);
+    if (gamePlayer) gamePlayer.connected = false;
+  }
+
+  /** Schedules a permanent-forfeit callback if `playerId` is still disconnected after the grace window. */
+  scheduleRemoval(playerId: string, onExpire: () => void) {
+    const player = this.players.get(playerId);
+    if (!player) return;
+    this.cancelRemoval(playerId);
+    player.removalTimer = setTimeout(onExpire, RECONNECT_WINDOW_MS);
+  }
+
+  cancelRemoval(playerId: string) {
+    const player = this.players.get(playerId);
+    if (player?.removalTimer) {
+      clearTimeout(player.removalTimer);
+      player.removalTimer = null;
+    }
   }
 
   get connectedCount(): number {
@@ -111,7 +142,7 @@ export class Room {
   startLobby() {
     this.transition("LOBBY");
     this.lobbyStartAt = Date.now();
-    this.lobbyEndAt = this.lobbyStartAt + LOBBY_DURATION_MS;
+    this.autoCloseAt = this.lobbyStartAt + ROOM_AUTO_CLOSE_MS;
   }
 
   /** Locks the player list and builds the authoritative game from whoever is present. Returns false if not enough players. */
@@ -137,8 +168,10 @@ export class Room {
       this.status = "EXPIRED";
     }
     this.chat = []; // in-memory chat is destroyed with the room, never persisted
-    if (this.lobbyTimer) clearTimeout(this.lobbyTimer);
-    if (this.expireTimer) clearTimeout(this.expireTimer);
+    if (this.autoCloseTimer) clearTimeout(this.autoCloseTimer);
+    for (const player of this.players.values()) {
+      if (player.removalTimer) clearTimeout(player.removalTimer);
+    }
   }
 
   addChatMessage(playerId: string, name: string, text: string): ChatMessage {
@@ -160,7 +193,7 @@ export class Room {
       status: this.status,
       maxPlayers: this.maxPlayers,
       lobbyStartAt: this.lobbyStartAt,
-      lobbyEndAt: this.lobbyEndAt,
+      autoCloseAt: this.autoCloseAt,
       serverTime: Date.now(),
       players: this.joinOrder
         .map((id) => this.players.get(id))

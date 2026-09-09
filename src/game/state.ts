@@ -11,10 +11,21 @@ function makePieces(color: Color): Piece[] {
   return [0, 1, 2, 3].map((i) => ({ id: `${color}-${i}`, color, steps: 0 }));
 }
 
+/**
+ * Assigns board colors for a match. With exactly 2 players, colors are seated diagonally
+ * opposite (red + yellow) rather than side-by-side (red + green) — this matches how real
+ * Ludo boards are played 1v1 and keeps both players' home stretches from touching.
+ */
+function assignColors(count: number): Color[] {
+  if (count === 2) return ["red", "yellow"];
+  return COLORS.slice(0, count);
+}
+
 /** Assigns colors in join order and builds the initial authoritative game state. */
 export function createInitialGameState(players: NewPlayerInput[]): GameState {
+  const colors = assignColors(players.length);
   const assigned: PlayerState[] = players.map((p, i) => {
-    const color = COLORS[i % COLORS.length];
+    const color = colors[i];
     return {
       id: p.id,
       color,
@@ -24,6 +35,7 @@ export function createInitialGameState(players: NewPlayerInput[]): GameState {
       connected: true,
       pieces: makePieces(color),
       finished: false,
+      left: false,
     };
   });
 
@@ -36,6 +48,7 @@ export function createInitialGameState(players: NewPlayerInput[]): GameState {
     consecutiveSixes: 0,
     winnerId: null,
     version: 1,
+    waitingForPlayerId: null,
   };
 }
 

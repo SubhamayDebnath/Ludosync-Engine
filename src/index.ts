@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { WebSocketServer } from "ws";
 import { healthRoutes } from "./routes/health.js";
+import { adminRoutes } from "./routes/admin.js";
 import { handleConnection } from "./websocket/handlers.js";
 import { getDb } from "./db/mongo.js";
 
@@ -21,6 +22,7 @@ app.use(
 );
 
 app.route("/", healthRoutes);
+app.route("/admin", adminRoutes);
 
 const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
   console.log(`ludo-engine listening on :${info.port}`);

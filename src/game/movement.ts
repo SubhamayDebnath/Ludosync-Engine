@@ -19,7 +19,7 @@ export function applyMove(state: GameState, pieceId: string): ApplyMoveResult {
   if (state.currentDice === null) return { ok: false, error: "no_dice_rolled" };
 
   const player = currentPlayer(state);
-  const legal = legalMovesForPlayer(player, state.currentDice);
+  const legal = legalMovesForPlayer(state, player, state.currentDice);
   const move = legal.find((m) => m.pieceId === pieceId);
   if (!move) return { ok: false, error: "illegal_move" };
 
@@ -41,7 +41,18 @@ export function applyMove(state: GameState, pieceId: string): ApplyMoveResult {
     state.status = "FINISHED";
   }
 
-  const grantExtraTurn = state.currentDice === 6 && !wonNow;
+  // Indian Ludo bonus-roll rule: a 6 OR landing a capture earns another roll.
+  const rolledSix = state.currentDice === 6;
+  const capturedAny = captures.length > 0;
+  const grantExtraTurn = (rolledSix || capturedAny) && !wonNow;
+  const bonusReason: LastMoveInfo["bonusReason"] | undefined = !grantExtraTurn
+    ? undefined
+    : rolledSix && capturedAny
+      ? "six_and_capture"
+      : rolledSix
+        ? "six"
+        : "capture";
+
   state.currentDice = null;
   state.diceRolledThisTurn = false;
   if (!grantExtraTurn && !wonNow) {
@@ -51,19 +62,24 @@ export function applyMove(state: GameState, pieceId: string): ApplyMoveResult {
 
   return {
     ok: true,
-    info: { playerId: player.id, pieceId, from, to: move.toSteps, captured: captures },
+    info: { playerId: player.id, pieceId, from, to: move.toSteps, captured: captures, bonusReason },
     wonPlayerId: wonNow ? player.id : undefined,
   };
 }
 
-/** Moves turnIndex to the next player who still has an active seat. */
+/** Moves turnIndex to the next player who still holds an active, in-play seat. */
 export function advanceTurn(state: GameState): void {
   const n = state.players.length;
   for (let i = 1; i <= n; i++) {
     const idx = (state.turnIndex + i) % n;
-    state.turnIndex = idx;
-    return;
+    const candidate = state.players[idx];
+    if (!candidate.left && !candidate.finished) {
+      state.turnIndex = idx;
+      return;
+    }
   }
+  // No eligible player found (everyone else has left or finished) — leave turnIndex as-is;
+  // the caller is expected to have already ended the game in this case.
 }
 
 /** Skips the current player's turn (used when they have no legal moves, or on triple-six forfeit). */

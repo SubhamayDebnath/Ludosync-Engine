@@ -1,4 +1,6 @@
 import {
+  COMMON_TRACK_LENGTH,
+  Color,
   FINISH_STEP,
   GameState,
   Piece,
@@ -29,19 +31,43 @@ export interface LegalMove {
   toSteps: number;
 }
 
+/**
+ * Indian Ludo "block" rule: two or more of one player's pieces stacked on the same
+ * common-track square form a block that no opponent piece may land on. (We don't simulate
+ * passing over intermediate squares — only the landing square — since this engine, like most
+ * online Ludo implementations, moves pieces by total step count rather than square-by-square.)
+ */
+export function isBlockedForOpponent(state: GameState, movingColor: Color, square: number): boolean {
+  for (const opponent of state.players) {
+    if (opponent.color === movingColor) continue;
+    const stackedHere = opponent.pieces.filter(
+      (p) => isOnCommonTrack(p.steps) && globalSquare(p, p.steps) === square,
+    ).length;
+    if (stackedHere >= 2) return true;
+  }
+  return false;
+}
+
 /** All legal moves for the current player given the rolled dice. */
-export function legalMovesForPlayer(player: PlayerState, dice: number): LegalMove[] {
+export function legalMovesForPlayer(state: GameState, player: PlayerState, dice: number): LegalMove[] {
   const moves: LegalMove[] = [];
   for (const piece of player.pieces) {
     if (piece.steps === FINISH_STEP) continue; // already home
     if (piece.steps === 0) {
       if (dice === 6) {
-        moves.push({ pieceId: piece.id, fromSteps: 0, toSteps: 1 });
+        const entrySquare = globalSquare({ color: player.color } as Piece, 1);
+        if (!isBlockedForOpponent(state, player.color, entrySquare)) {
+          moves.push({ pieceId: piece.id, fromSteps: 0, toSteps: 1 });
+        }
       }
       continue;
     }
     const target = piece.steps + dice;
     if (target <= FINISH_STEP) {
+      if (target <= COMMON_TRACK_LENGTH) {
+        const landingSquare = globalSquare(piece, target);
+        if (isBlockedForOpponent(state, player.color, landingSquare)) continue;
+      }
       moves.push({ pieceId: piece.id, fromSteps: piece.steps, toSteps: target });
     }
   }
